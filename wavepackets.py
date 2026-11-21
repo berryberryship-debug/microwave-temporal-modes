@@ -1,3 +1,12 @@
+"""
+wavepackets.py
+Bases de modes temporels, propagation dispersive du lien et couplage d'absorption.
+
+Convention (Kiilerich & Molmer, PRL 123, 123604, Eqs. 2-3) :
+    g_u(t) =  u*(t) / sqrt(1 - int_{-inf}^t |u|^2)   (cavite virtuelle emettrice)
+    g_v(t) = -v*(t) / sqrt(int_{-inf}^t |v|^2)       (cavite virtuelle absorbante)
+"""
+
 import numpy as np
 from scipy.special import hermite
 from scipy.integrate import cumulative_trapezoid
@@ -48,9 +57,30 @@ def generate_gram_schmidt_exponential_basis(
     return basis
 
 
+def generate_sech_polynomial_basis(t: np.ndarray, gamma_bw: float) -> np.ndarray:
+    """
+    Trois premiers modes de la famille sech de Hernandez-Anton et al.
+    (arXiv:2604.12947, Eqs. 1-3) :
+        f0 = sqrt(G)/2 sech(G t/2)
+        f1 = sqrt(3G)/(2 pi) (G t) sech(G t/2)
+        f2 = sqrt(5G)/(8 pi^2) (3 G^2 t^2 - pi^2) sech(G t/2)
+    gamma_bw = Gamma en rad/ns ; t en ns. Orthonormalite verifiable par
+    verify_orthonormality (fenetre suffisamment large requise).
+    """
+    G = gamma_bw
+    sech = 1.0 / np.cosh(G * t / 2.0)
+    f0 = np.sqrt(G) / 2.0 * sech
+    f1 = np.sqrt(3.0 * G) / (2.0 * np.pi) * (G * t) * sech
+    f2 = np.sqrt(5.0 * G) / (8.0 * np.pi**2) * (3.0 * G**2 * t**2 - np.pi**2) * sech
+    return np.vstack([f0, f1, f2]).astype(np.complex128)
+
+
 def propagate_dispersive_link(
     u_t: np.ndarray, cfg: HardwareConfig, apply_loss: bool = True
 ) -> np.ndarray:
+    # NB : FFT periodique, sans remplissage de zeros ; avec beta_2 = 1.5e-22 s^2/m
+    # l'effet est negligeable (~1e-16), mais pour une forte dispersion il faudrait
+    # elargir la fenetre temporelle.
     dt_sec = cfg.dt * 1e-9
     freqs_hz = np.fft.fftfreq(len(u_t), d=dt_sec)
     delta_omega = 2.0 * np.pi * freqs_hz
@@ -68,6 +98,12 @@ def propagate_dispersive_link(
 def compute_impedance_matched_coupling(
     u_target: np.ndarray, cfg: HardwareConfig, apply_hardware_limits: bool = True
 ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Couplage d'absorption g_v(t) = -v*(t)/sqrt(int |v|^2) (Eq. 3 de PRL 123, 123604).
+    Le masque [cum_lo, cum_hi] (en fraction de l'energie totale) regularise la
+    divergence de |g|^2 dans la queue precoce ; il est desormais parametrable
+    dans HardwareConfig. Retourne (|g|^2, g complexe).
+    """
     dt = cfg.dt
     power = np.abs(u_target) ** 2
     cum_energy = cumulative_trapezoid(power, dx=dt, initial=0.0)
@@ -75,13 +111,17 @@ def compute_impedance_matched_coupling(
     gamma_ideal = power / (cum_energy + cfg.eps_reg)
 
     total_energy = np.trapezoid(power, dx=dt)
-    mask_active = (cum_energy > 1e-5 * total_energy) & (cum_energy < 0.9995 * total_energy)
+    mask_active = (cum_energy > cfg.cum_lo * total_energy) & (
+        cum_energy < cfg.cum_hi * total_energy
+    )
     gamma_ideal = np.where(mask_active, gamma_ideal, 0.0)
 
     phase_target = np.angle(u_target)
-    g_complex = np.sqrt(gamma_ideal) * np.exp(1j * phase_target)
+    g_complex = -np.sqrt(gamma_ideal) * np.exp(-1j * phase_target)  # -v*/sqrt(...)
 
     if apply_hardware_limits:
+        # Lissage gaussien heuristique (sigma = 1/kappa_buffer), faute d'un modele
+        # de resonateur a reponse exponentielle.
         sigma_steps = max(0.5, (1.0 / cfg.kappa_buffer) / dt)
         g_real = gaussian_filter1d(np.real(g_complex), sigma=sigma_steps)
         g_imag = gaussian_filter1d(np.imag(g_complex), sigma=sigma_steps)
@@ -118,9 +158,8 @@ if __name__ == "__main__":
     gram_hg = verify_orthonormality(hg_modes, cfg.dt)
 
     gs_modes = generate_gram_schmidt_exponential_basis(t, cfg.tau_pulse, n_modes=4)
-    gram_gs = verify_orthonormality(gs_modes, cfg.dt)
+    gram_gs = verify_orthonormality(gs_modes, cfg.dt)  # tautologique : base construite par Gram-Schmidt
 
-    u0_prop = propagate_dispersive_link(hg_modes[0], cfg, apply_loss=False)
     u1_prop = propagate_dispersive_link(hg_modes[1], cfg, apply_loss=False)
     crosstalk_01 = np.abs(np.trapezoid(np.conj(hg_modes[0]) * u1_prop, dx=cfg.dt)) ** 2
 
@@ -129,5 +168,6 @@ if __name__ == "__main__":
     print(f"[PASS] Hermite-Gauss Gram max error: {np.max(np.abs(gram_hg - np.eye(4))):.2e}")
     print(f"[PASS] Gram-Schmidt Exp Gram max error: {np.max(np.abs(gram_gs - np.eye(4))):.2e}")
     print(f"[INFO] 30m Link Power Transmission: {cfg.link_transmission * 100:.2f}%")
-    print(f"[INFO] Peak Coupler Rate for HG0: {np.max(gamma_0) / (2 * np.pi) * 1e3:.2f} MHz")
+    print(f"[INFO] Peak Coupler Rate for HG0: {np.max(gamma_0) / (2 * np.pi) * 1e3:.2f} MHz "
+          f"(fixe par le seuil cum_lo={cfg.cum_lo:g}, pas par la physique)")
     print(f"[INFO] Dispersion-induced |<u0 | u1_prop>|^2 crosstalk: {crosstalk_01:.2e}")
