@@ -1,11 +1,26 @@
 """
 calibration.py
-Calibration in situ par tomographie hétérodyne IQ et pré-distorsion itérative
-des enveloppes d'émission et de réception (dispersion 30m + décalage AC Stark).
+Calibration en boucle fermee du couplage recepteur g_rec(t).
+
+REMPLACEMENT : l'ancienne regle de mise a jour heuristique (correction point par point
+a partir de Re/Im de <L_tot>/g_rec) a ete retiree. Mesuree avec le solveur corrige, elle
+degradait la capture (97,75 % -> 73,39 %) pour toutes les valeurs de pas testees.
+
+Nouvelle approche : optimisation sans gradient (Nelder-Mead) d'un petit nombre de
+parametres physiques, avec pour objectif l'energie sortante mesuree pour l'etat sonde
+(|0>+|1>)/sqrt(2) :
+    g_rec(t) = a * |g0(t)| * exp( i [ arg g0(t) + s * Theta0(t) ] ),   Theta0(t) = int_{-inf}^t |g0|^2 d tau
+  - s : phase proportionnelle a l'integrale du taux, qui compense un decalage Stark
+        delta(t) = stark_coeff * |g(t)|^2 (la phase accumulee vaut stark_coeff * Theta0),
+  - a : facteur d'amplitude global (borne par sqrt(gamma_max)).
+Ce modele suppose que le decalage Stark suit la forme ci-dessus ; il ne compense pas
+d'autres imperfections. Aucune comparaison a une mesure reelle n'a ete faite.
 """
 
 from dataclasses import dataclass
 import numpy as np
+from scipy.integrate import cumulative_trapezoid
+from scipy.optimize import minimize
 from config import HardwareConfig
 from wavepackets import (
     generate_hermite_gauss_basis,
@@ -17,19 +32,20 @@ from slh_solver import simulate_cascaded_scattering
 
 @dataclass
 class CalibrationReport:
-    g_rec_calibrated: np.ndarray        # Profil de couplage complexe optimisé g_rec(t)
-    reflection_history: list[float]     # Énergie réfléchie résiduelle à chaque itération
-    capture_before: float               # Probabilité de capture P_e avant calibration
-    capture_after: float                # Probabilité de capture P_e après calibration
-    crosstalk_before: float             # Diaphonie du mode orthogonal avant calibration
-    crosstalk_after: float              # Diaphonie du mode orthogonal après calibration
+    g_rec_calibrated: np.ndarray        # Profil de couplage complexe optimise g_rec(t)
+    reflection_history: list            # Objectif (energie sortante, etat sonde) a chaque evaluation
+    capture_before: float               # P_e avant calibration
+    capture_after: float                # P_e apres calibration
+    crosstalk_before: float             # P_e du mode orthogonal avant calibration
+    crosstalk_after: float              # P_e du mode orthogonal apres calibration
+    amp_scale: float                    # parametre a optimise
+    stark_phase_coeff: float            # parametre s optimise
 
 
 def predistort_emitter_dispersion(u_target: np.ndarray, cfg: HardwareConfig) -> np.ndarray:
     """
-    Applique la pré-distorsion de phase conjuguée au niveau de l'AWG émetteur
-    pour annuler exactement la dispersion de vitesse de groupe (beta_2 * L)
-    accumulée sur le lien de 30 mètres.
+    Phase conjuguee de la dispersion beta_2 * L (inverse de propagate_dispersive_link).
+    Avec beta_2 = 1.5e-22 s^2/m l'effet est negligeable (~1e-16).
     """
     dt_sec = cfg.dt * 1e-9
     freqs_hz = np.fft.fftfreq(len(u_target), d=dt_sec)
@@ -39,79 +55,54 @@ def predistort_emitter_dispersion(u_target: np.ndarray, cfg: HardwareConfig) -> 
     inverse_dispersion = np.exp(+0.5j * cfg.beta_2 * cfg.link_length_m * (delta_omega**2))
     u_predistorted = np.fft.ifft(u_omega * inverse_dispersion)
 
-    # Re-normalisation pour conserver l'énergie unitaire de l'enveloppe d'émission
     norm = np.sqrt(np.trapezoid(np.abs(u_predistorted) ** 2, dx=cfg.dt))
     return u_predistorted / norm
+
+
+def _build_g_rec(g0: np.ndarray, theta0: np.ndarray, a: float, s: float, cfg: HardwareConfig) -> np.ndarray:
+    amp = np.clip(a * np.abs(g0), 0.0, np.sqrt(cfg.gamma_max))
+    return amp * np.exp(1j * (np.angle(g0) + s * theta0))
 
 
 def calibrate_receiver_in_situ(
     u_arriving: np.ndarray,
     u_orthogonal: np.ndarray,
     cfg: HardwareConfig,
-    n_iterations: int = 12,
-    lr_phase: float = 0.85,
-    lr_amp: float = 0.35,
+    n_iterations: int = 60,
 ) -> CalibrationReport:
     """
-    Optimise le couplage complexe g_rec(t) du récepteur en boucle fermée
-    par minimisation du champ hétérodyne réfléchi <L_tot(t)> sous superposition (|0>+|1>)/sqrt(2).
+    n_iterations : nombre maximal d'iterations de Nelder-Mead.
     """
-    # 1. Estimation analytique initiale (sans connaissance du Stark shift dynamique)
-    _, g_rec = compute_impedance_matched_coupling(
-        u_arriving, cfg, apply_hardware_limits=True
-    )
+    _, g0 = compute_impedance_matched_coupling(u_arriving, cfg, apply_hardware_limits=True)
+    theta0 = cumulative_trapezoid(np.abs(g0) ** 2, dx=cfg.dt, initial=0.0)
 
-    # Mesures de référence avant calibration (avec AC Stark shift actif)
     res_init_match = simulate_cascaded_scattering(
-        u_arriving, g_rec, cfg, initial_photon_state="single", include_stark_shift=True
+        u_arriving, g0, cfg, initial_photon_state="single", include_stark_shift=True
     )
     res_init_ortho = simulate_cascaded_scattering(
-        u_orthogonal, g_rec, cfg, initial_photon_state="single", include_stark_shift=True
+        u_orthogonal, g0, cfg, initial_photon_state="single", include_stark_shift=True
     )
 
-    reflection_history: list[float] = []
+    history: list[float] = []
 
-    # 2. Boucle de rétroaction hétérodyne IQ
-    for _ in range(n_iterations):
-        # Sondage avec état superposition (|0> + |1>)/sqrt(2) pour accéder à <L_tot(t)> = I(t) + iQ(t)
-        res_probe = simulate_cascaded_scattering(
-            u_arriving,
-            g_rec,
-            cfg,
-            initial_photon_state="superposition",
-            include_stark_shift=True,
+    def objective(params: np.ndarray) -> float:
+        a, s = float(params[0]), float(params[1])
+        g = _build_g_rec(g0, theta0, a, s, cfg)
+        probe = simulate_cascaded_scattering(
+            u_arriving, g, cfg, initial_photon_state="superposition", include_stark_shift=True
         )
-        reflection_history.append(res_probe.total_reflected)
+        history.append(probe.total_reflected)
+        return probe.total_reflected
 
-        # Champ cohérent réfléchi : L_tot(t) = g_u(t) <a(t)> + g_rec(t) <b(t)>
-        a_ref = res_probe.a_ref_mean
-        mask_active = np.abs(g_rec) > 1e-4 * np.max(np.abs(g_rec))
+    opt = minimize(
+        objective,
+        x0=np.array([1.0, 0.0]),
+        method="Nelder-Mead",
+        options={"maxiter": n_iterations, "xatol": 1e-4, "fatol": 1e-9},
+    )
+    a_opt, s_opt = float(opt.x[0]), float(opt.x[1])
+    g_rec = _build_g_rec(g0, theta0, a_opt, s_opt, cfg)
 
-        # Correction de phase : le déphasage de a_ref par rapport à g_rec révèle le Stark shift Delta(t)
-        phase_err = np.zeros_like(cfg.time_grid)
-        phase_err[mask_active] = np.imag(
-            a_ref[mask_active] / (g_rec[mask_active] + cfg.eps_reg)
-        )
-
-        # Correction d'amplitude : la composante en phase indique une sous- ou sur-absorption
-        amp_err = np.zeros_like(cfg.time_grid)
-        amp_err[mask_active] = np.real(
-            a_ref[mask_active] / (g_rec[mask_active] + cfg.eps_reg)
-        )
-
-        # Mise à jour de l'enveloppe complexe du coupleur
-        amp_curr = np.abs(g_rec)
-        phase_curr = np.angle(g_rec)
-
-        amp_new = np.clip(
-            amp_curr * (1.0 - lr_amp * amp_err),
-            0.0,
-            np.sqrt(cfg.gamma_max),
-        )
-        phase_new = phase_curr - lr_phase * phase_err
-        g_rec = amp_new * np.exp(1j * phase_new)
-
-    # 3. Évaluation finale après calibration
     res_final_match = simulate_cascaded_scattering(
         u_arriving, g_rec, cfg, initial_photon_state="single", include_stark_shift=True
     )
@@ -121,11 +112,13 @@ def calibrate_receiver_in_situ(
 
     return CalibrationReport(
         g_rec_calibrated=g_rec,
-        reflection_history=reflection_history,
+        reflection_history=history,
         capture_before=float(res_init_match.p_e[-1]),
         capture_after=float(res_final_match.p_e[-1]),
         crosstalk_before=float(res_init_ortho.p_e[-1]),
         crosstalk_after=float(res_final_ortho.p_e[-1]),
+        amp_scale=a_opt,
+        stark_phase_coeff=s_opt,
     )
 
 
@@ -134,17 +127,16 @@ if __name__ == "__main__":
     t = cfg.time_grid
     modes = generate_hermite_gauss_basis(t, cfg.tau_pulse, n_modes=2)
 
-    # Pré-distorsion de dispersion à l'émission + propagation sur 30 m
     u0_pre = predistort_emitter_dispersion(modes[0], cfg)
     u1_pre = predistort_emitter_dispersion(modes[1], cfg)
 
     u0_arriving = propagate_dispersive_link(u0_pre, cfg, apply_loss=False)
     u1_arriving = propagate_dispersive_link(u1_pre, cfg, apply_loss=False)
 
-    report = calibrate_receiver_in_situ(
-        u0_arriving, u1_arriving, cfg, n_iterations=12
-    )
+    report = calibrate_receiver_in_situ(u0_arriving, u1_arriving, cfg)
 
-    print(f"[INFO] Réflexion résiduelle (it. 0 -> it. 12) : {report.reflection_history[0]:.4f} -> {report.reflection_history[-1]:.4f}")
+    print(f"[INFO] Objectif (sortie, etat sonde) : {report.reflection_history[0]:.4f} -> {report.reflection_history[-1]:.2e} "
+          f"({len(report.reflection_history)} evaluations)")
+    print(f"[INFO] Parametres : a = {report.amp_scale:.4f}, s = {report.stark_phase_coeff:.4f} (stark_coeff = {cfg.stark_coeff})")
     print(f"[INFO] Capture mode cible HG0 : {report.capture_before*100:.2f}% -> {report.capture_after*100:.2f}%")
     print(f"[INFO] Diaphonie mode orthogonal HG1 : {report.crosstalk_before*100:.2f}% -> {report.crosstalk_after*100:.2f}%")
